@@ -1,0 +1,15 @@
+
+[Unit]
+Description=Node File Server + YML generator
+After=network.target
+
+[Service]
+EnvironmentFile=/opt/filesvc/.env
+WorkingDirectory=/opt/filesvc
+ExecStart=/usr/bin/node /opt/filesvc/server.js
+User=filesvc
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="/opt/filesvc"
+FILES_DIR="/srv/files"
+SVC_USER="filesvc"
+PORT_DEFAULT="3001"
+TZ_DEFAULT="Europe/Moscow"
+
+DEFAULT_GIT_URL="https://github.com/sayqow/FeedGenerator.git"
+
+usage() {
+  cat <<'EOF'
+FeedGenerator (Git) Installer
+-----------------------------
+Usage:
+  sudo ./filesvc-git-installer.run [options]
+
+Options:
+  --git URL                  Git repo URL (default: https://github.com/sayqow/FeedGenerator.git)
+  --branch NAME              Git branch (default: main)
+  --tag TAG                  Git tag (exclusive with --branch)
+  --non-interactive          No prompts
+  --domain DOMAIN            Public domain (optional)
+  --email EMAIL              Email for Let's Encrypt (optional)
+  --port PORT                App port (default: 3001)
+  --tz TIMEZONE              System timezone (default: Europe/Moscow)
+  --spreadsheets "ID1,ID2"   Sheet IDs (empty = auto-discover)
+  --sa-json PATH             Path to service account JSON to /opt/filesvc/sa.json
+  --skip-nginx               Do not configure nginx
+  --force-nginx              Configure nginx with server_name _ (IP-only)
+  --reinstall                Reinstall/repair even if installed
+  --uninstall                Uninstall services and app (keeps /srv/files)
+  -h, --help                 Show help
+EOF
+}
+
+info(){ echo -e "\033[1;34m[INFO]\033[0m $*"; }
+warn(){ echo -e "\033[1;33m[WARN]\033[0m $*"; }
+err(){ echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
+need_root(){ [[ $EUID -eq 0 ]] || { err "Run as root"; exit 1; }; }
+
+GIT_URL="$DEFAULT_GIT_URL"; BRANCH="main"; TAG=""
+DOMAIN=""; EMAIL=""; PORT="$PORT_DEFAULT"; TZ="$TZ_DEFAULT"; SPREADSHEETS=""
+NONINTERACTIVE=0; SKIP_NGINX=0; FORCE_NGINX=0; REINSTALL=0; UNINSTALL=0
+SA_JSON_PATH=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --git) GIT_URL="$2"; shift 2;;
+    --branch) BRANCH="$2"; shift 2;;
+    --tag) TAG="$2"; shift 2;;
+    --non-interactive) NONINTERACTIVE=1; shift;;
+    --domain) DOMAIN="$2"; shift 2;;
+    --email) EMAIL="$2"; shift 2;;
+    --port) PORT="$2"; shift 2;;
+    --tz) TZ="$2"; shift 2;;
+    --spreadsheets) SPREADSHEETS="$2"; shift 2;;
+    --sa-json) SA_JSON_PATH="$2"; shift 2;;
+    --skip-nginx) SKIP_NGINX=1; shift;;
+    --force-nginx) FORCE_NGINX=1; shift;;
+    --reinstall) REINSTALL=1; shift;;
+    --uninstall) UNINSTALL=1; shift;;
+    -h|--help) usage; exit 0;;
+    *) err "Unknown option: $1"; usage; exit 1;;
+  esac
+done
+
+need_root
+
+if [[ $UNINSTALL -eq 1 ]]; then
+  info "Stopping services..."
+  systemctl disable --now filesvc-feed.timer filesvc-feed.service filesvc.service 2>/dev/null || true
+  rm -f /etc/systemd/system/filesvc*.service /etc/systemd/system/filesvc*.timer || true
+  systemctl daemon-reload || true
+  rm -rf "$APP_DIR"
+  info "Uninstalled. Note: files in $FILES_DIR remain."
+  exit 0
+fi
+
+info "[1/9] Base packages"
+apt-get update -y
+apt-get install -y git ca-certificates curl jq unzip nginx || true
+
+info "[2/9] Timezone -> $TZ"
+timedatectl set-timezone "$TZ" || true
+
+info "[3/9] Create user and dirs"
+id -u "$SVC_USER" &>/dev/null || adduser --system --group --home "$APP_DIR" "$SVC_USER"
+mkdir -p "$FILES_DIR"
+chown -R "$SVC_USER:$SVC_USER" "$FILES_DIR"
+
+fresh_install=1
+[[ -d "$APP_DIR/.git" ]] && fresh_install=0
+[[ $REINSTALL -eq 1 ]] && fresh_install=1
+
+info "[4/9] Fetch project from Git: $GIT_URL"
+if [[ $fresh_install -eq 1 ]]; then
+  rm -rf "$APP_DIR"
+  mkdir -p "$APP_DIR"
+  git clone --depth 1 "$GIT_URL" "$APP_DIR"
+  cd "$APP_DIR"
+  if [[ -n "$TAG" ]]; then
+    git fetch --tags --depth 1
+    git checkout "tags/${TAG}" -b "deploy-${TAG}"
+  elif [[ "$BRANCH" != "main" ]]; then
+    git fetch origin "$BRANCH" --depth 1
+    git checkout "$BRANCH"
+  fi
+else
+  cd "$APP_DIR"
+  git fetch --all --prune
+  if [[ -n "$TAG" ]]; then
+    git checkout -B "deploy-${TAG}" "tags/${TAG}"
+  else
+    git checkout "$BRANCH" 2>/dev/null || true
+    git pull --rebase --autostash origin "$BRANCH" || true
+  fi
+fi
+chown -R "$SVC_USER:$SVC_USER" "$APP_DIR"
+
+info "[5/9] Node.js & deps"
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+fi
+sudo -u "$SVC_USER" bash -lc "cd '$APP_DIR' && if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi"
+
+info "[6/9] .env"
+ENV_FILE="$APP_DIR/.env"
+if [[ $NONINTERACTIVE -eq 0 ]]; then
+  read -rp "Domain (optional, e.g. feed.example.com): " DOMAIN
+  read -rp "Admin e-mail for SSL (optional): " EMAIL
+  read -rp "Port [${PORT_DEFAULT}]: " P; PORT=${P:-$PORT}
+  read -rp "Service Account JSON path (optional): " SA_JSON_PATH
+  read -rp "SPREADSHEET_IDS (comma separated, empty=auto): " SPREADSHEETS
+fi
+SA_FILE="$APP_DIR/sa.json"
+if [[ -n "$SA_JSON_PATH" && -f "$SA_JSON_PATH" ]]; then
+  cp -f "$SA_JSON_PATH" "$SA_FILE"; chown "$SVC_USER:$SVC_USER" "$SA_FILE"; chmod 600 "$SA_FILE"
+fi
+cat > "$ENV_FILE" <<EOF
+PORT=$PORT
+BASE_PATH=/
+FILES_DIR=$FILES_DIR
+GOOGLE_APPLICATION_CREDENTIALS=$SA_FILE
+SPREADSHEET_IDS=${SPREADSHEETS}
+SHEET_SETTINGS=Настройки
+SHEET_CATEGORIES=Категории
+SHEET_PRODUCTS=Товары
+SCRAPE_CONCURRENCY=5
+SCRAPE_TIMEOUT_MS=12000
+EOF
+chown "$SVC_USER:$SVC_USER" "$ENV_FILE"; chmod 600 "$ENV_FILE"
+
+info "[7/9] systemd"
+cp "$APP_DIR/deploy/systemd/filesvc.service" /etc/systemd/system/
+cp "$APP_DIR/deploy/systemd/filesvc-feed.service" /etc/systemd/system/
+cp "$APP_DIR/deploy/systemd/filesvc-feed.timer" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now filesvc || true
+systemctl enable --now filesvc-feed.timer || true
+
+nginx_should=0
+if [[ $SKIP_NGINX -eq 0 ]]; then
+  if [[ -n "$DOMAIN" || $FORCE_NGINX -eq 1 ]]; then nginx_should=1; fi
+fi
+
+if [[ $nginx_should -eq 1 ]]; then
+  info "[8/9] nginx"
+  [[ -n "$DOMAIN" ]] || DOMAIN="_"
+  SITE="/etc/nginx/sites-available/${DOMAIN}.conf"
+  cat > "$SITE" <<NGX
+server {
+  listen 80;
+  server_name ${DOMAIN};
+  client_max_body_size 200m;
+
+  location / {
+    proxy_pass http://127.0.0.1:${PORT};
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+  }
+}
+NGX
+  ln -sf "$SITE" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
+  sed -i 's/^\s*listen \[::\]:80/# &/g' /etc/nginx/sites-available/default 2>/dev/null || true
+  sed -i 's/^\s*listen \[::\]:443/# &/g' /etc/nginx/sites-available/default 2>/dev/null || true
+  nginx -t && systemctl restart nginx
+  if [[ -n "$EMAIL" && "$DOMAIN" != "_" ]]; then
+    apt-get install -y certbot python3-certbot-nginx || true
+    certbot --nginx -d "$DOMAIN" -m "$EMAIL" --agree-tos --no-eff-email || true
+  fi
+fi
+
+info "[9/9] Done"
+echo "Health:    curl -s http://127.0.0.1:${PORT}/healthz"
+echo "UI:        http://${DOMAIN:-<your-ip>}/"
+echo "Docs:      http://${DOMAIN:-<your-ip>}/view/API.md"
+echo "Build YML: curl -X POST http://${DOMAIN:-<your-ip>}/api/feed/yml/build"

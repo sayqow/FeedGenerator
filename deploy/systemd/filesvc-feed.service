@@ -1,0 +1,11 @@
+
+[Unit]
+Description=Generate YML feeds from Google Sheets
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/filesvc/.env
+WorkingDirectory=/opt/filesvc
+ExecStart=/usr/bin/node /opt/filesvc/cli-generate.js
+User=filesvc

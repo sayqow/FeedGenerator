@@ -1,0 +1,11 @@
+
+[Unit]
+Description=Weekly YML build (Mon 10:00 MSK)
+
+[Timer]
+OnCalendar=Mon *-*-* 07:00:00
+Persistent=true
+Unit=filesvc-feed.service
+
+[Install]
+WantedBy=timers.target
