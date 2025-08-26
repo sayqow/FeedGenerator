@@ -1,6 +1,6 @@
 ## Authors
 - [@Sayqow](https://github.com/sayqow) — разработка и тестирование
-- [@Unlalka](https://github.com/unlalka) — документация и идея <3
+- [@Unlalka](https://github.com/unlalka) — документация и идея 
 
 # FeedGenerator
 
