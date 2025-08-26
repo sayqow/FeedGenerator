@@ -5,9 +5,11 @@
 
 ## Быстрый старт
 ```bash
-npm install
-node server.js
-# открой http://127.0.0.1:3001/
+Положи на сервер 2 файла(sa.json и filesvc.run)
+cd <Папка в которую положил файлы>  example /opt/
+chmod +x filesvc.run
+sudo ./filesvc.run --auto-discoveraa
+# открой http://IP-Сервера:3001/
 ```
 
 ## Переменные окружения (.env)
