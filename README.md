@@ -13,78 +13,68 @@ sudo ./filesvc.run --auto-discoveraa
 ```
 
 
-Настройка Google Cloud для File & Feed Service
+# Настройка Google Cloud для File & Feed Service
 
-Эта инструкция нужна, чтобы сервис мог читать данные из Google Sheets и Google Drive через Service Account (сервисную учётку) и файл ключа sa.json.
+Эта инструкция нужна, чтобы сервис мог читать данные из Google Sheets и Google Drive через **Service Account** (сервисную учётку) и файл ключа `sa.json`.
 
-1. Создать проект в Google Cloud Console
+---
 
-Перейди в Google Cloud Console
-.
+## 1. Создать проект в Google Cloud Console
 
-В верхнем меню выбери или создай новый проект:
+1. Перейди в [Google Cloud Console](https://console.cloud.google.com/).
+2. В верхнем меню выбери или создай новый проект:
+   - **«Выбрать проект» → «Новый проект»**.
+   - Дай понятное имя, например `FeedGenerator`.
+   - Нажми **«Создать»**.
 
-«Выбрать проект» → «Новый проект».
+---
 
-Дай понятное имя, например FeedGenerator.
-
-Нажми «Создать».
-
-2. Включить API
+## 2. Включить API
 
 Для работы нужны два API:
-
-Google Sheets API
-
-Google Drive API
+- **Google Sheets API**
+- **Google Drive API**
 
 Чтобы включить:
+1. В левом меню: **APIs & Services → Library (Библиотека API)**.
+2. Найди **Google Sheets API** → нажми **Enable (Включить)**.
+3. Повтори шаг для **Google Drive API**.
 
-В левом меню: APIs & Services → Library (Библиотека API).
+---
 
-Найди Google Sheets API → нажми Enable (Включить).
+## 3. Создать Service Account
 
-Повтори шаг для Google Drive API.
+1. В левом меню: **APIs & Services → Credentials (Учетные данные)**.
+2. Нажми **Create credentials → Service account**.
+3. Укажи имя, например: `filesvc-service-account`.
+4. Роли можно не задавать (оставь по умолчанию — минимальные права).
+5. Создай аккаунт.
 
-3. Создать Service Account
+---
 
-В левом меню: APIs & Services → Credentials (Учетные данные).
+## 4. Создать ключ `sa.json`
 
-Нажми Create credentials → Service account.
-
-Укажи имя, например: filesvc-service-account.
-
-Роли можно не задавать (оставь по умолчанию — минимальные права).
-
-Создай аккаунт.
-
-4. Создать ключ sa.json
-
-Открой созданный сервисный аккаунт.
-
-Перейди во вкладку Keys.
-
-Нажми Add key → Create new key.
-
-Формат: JSON.
-
-Скачанный файл сохрани как sa.json.
+1. Открой созданный сервисный аккаунт.
+2. Перейди во вкладку **Keys**.
+3. Нажми **Add key → Create new key**.
+4. Формат: **JSON**.
+5. Скачанный файл **сохрани как `sa.json`**.
 
 ⚠️ Этот файл приватный. Не загружай его в публичный репозиторий!
 
-5. Дать доступ к таблицам
+---
+
+## 5. Дать доступ к таблицам
 
 Чтобы сервис смог читать таблицы:
 
-Открой Google таблицу (Google Sheets).
+1. Открой Google таблицу (Google Sheets).
+2. Нажми **Поделиться** (Share).
+3. Добавь e-mail сервисного аккаунта (он выглядит как `filesvc-service-account@PROJECT_ID.iam.gserviceaccount.com`).
+4. Выдай права **Читатель** (Viewer) или **Редактор** (Editor).
+5. Сохрани.
 
-Нажми Поделиться (Share).
-
-Добавь e-mail сервисного аккаунта (он выглядит как filesvc-service-account@PROJECT_ID.iam.gserviceaccount.com).
-
-Выдай права Читатель (Viewer) или Редактор (Editor).
-
-Сохрани.
+---
 
 
 ## Сервис/таймер
