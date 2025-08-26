@@ -413,8 +413,8 @@ app.get(bp('/'), async (_req, res) => {
   <div class="card">
     <h3>Файлы</h3>
     <table class="table" id="filesTable">
-      <thead><tr><th>Имя</th><th>Изменён</th><th>Товаров</th><th>Скачать</th></tr></thead>
-      <tbody><tr><td colspan="4" class="faded">Загружается…</td></tr></tbody>
+      <thead><tr><th>Имя</th><th>Изменён</th><th>Товаров</th><th>Скачать</th><th>Открыть</th></tr></thead>
+      <tbody><tr><td colspan="5" class="faded">Загружается…</td></tr></tbody>
     </table>
     <div class="footer">Created by <b>sayqow</b> + <b>unlalka</b> • <a href="#" id="linkMIT">MIT</a></div>
   </div>
@@ -491,7 +491,7 @@ function fmtDt(iso){
 
 async function refreshFiles(){
   const tbody = document.querySelector('#filesTable tbody');
-  tbody.innerHTML = '<tr><td colspan="4" class="faded">Загружаю…</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="5" class="faded">Загружается…</td></tr>';
   try{
     const r = await fetch(BP + '/api/feed/yml/list');
     const d = await r.json();
@@ -501,13 +501,16 @@ async function refreshFiles(){
         '<td>'+esc(fmtDt(f.mtimeIso))+'</td>'+
         '<td>'+(f.offers||0)+'</td>'+
         '<td><a class="btn btn-ghost" href="'+f.url+'" download>Скачать</a></td>'+
+        // Новая кнопка "Открыть" — без download, в новой вкладке
+        '<td><a class="btn btn-ghost" href="'+f.url+'" target="_blank" rel="noopener">Открыть</a></td>'+
       '</tr>'
     ).join('');
-    tbody.innerHTML = rows || '<tr><td colspan="4" class="faded">Пока пусто…</td></tr>';
+    tbody.innerHTML = rows || '<tr><td colspan="5" class="faded">Пока пусто…</td></tr>';
   }catch(e){
-    tbody.innerHTML = '<tr><td colspan="4" class="faded">Ошибка: '+esc(e.message)+'</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" class="faded">Ошибка: '+esc(e.message)+'</td></tr>';
   }
 }
+
 
 // build button with 60s cooldown
 let buildCooldown = 0, buildTimer = null;
