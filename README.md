@@ -1,6 +1,6 @@
-## Contributors
-Thanks to all the people who contribute 💜  
-[![Contributors](https://contrib.rocks/image?repo=org/repo-name)](https://github.com/org/repo-name/graphs/contributors)
+## Authors
+- [@username1](https://github.com/sayqow) — разработка и тестирование
+- [@username2](https://github.com/unlalka) — документация и идея
 
 # FeedGenerator
 
