@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================
+# filesvc-git-installer.run
+# =============================
+# Устанавливает/переустанавливает File & Feed Service из Git.
+# Автоматически:
+#  - Ставит Node.js 20 + npm, базовые пакеты
+#  - Клонирует/обновляет репозиторий (или принудительно реклонирует, если /opt/filesvc битый)
+#  - Устанавливает npm-зависимости от имени сервиса
+#  - Создаёт .env (подхватывает sa.json из папки установщика, если не задан)
+#  - Разворачивает systemd-сервисы и таймер авто‑сборки по понедельникам 07:00 МСК
+#  - Настраивает UFW и (опционально) NGINX reverse proxy
+#
+# Примеры:
+#   sudo ./filesvc-git-installer.run --auto-discover
+#   sudo ./filesvc-git-installer.run --sa-json /opt/sa.json --port 3001
+#   sudo ./filesvc-git-installer.run --with-nginx --domain feed.example.com
+#   sudo ./filesvc-git-installer.run --force-reclone
+# =============================
+
+REPO_URL="https://github.com/sayqow/FeedGenerator.git"
+BRANCH="main"
+PORT="3001"
+SA_JSON=""
+WITH_NGINX="0"
+DOMAIN=""
+EMAIL=""
+AUTO_DISCOVER="0"
+FORCE_RECLONE="0"
+
+INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo) REPO_URL="${2:?}"; shift 2;;
+    --branch) BRANCH="${2:?}"; shift 2;;
+    --port) PORT="${2:?}"; shift 2;;
+    --sa-json) SA_JSON="${2:?}"; shift 2;;
+    --auto-discover) AUTO_DISCOVER="1"; shift 1;;
+    --with-nginx) WITH_NGINX="1"; shift 1;;
+    --domain) DOMAIN="${2:?}"; shift 2;;
+    --email) EMAIL="${2:-}"; shift $(( $#>=2 ? 2 : 1));;
+    --force-reclone) FORCE_RECLONE="1"; shift 1;;
+    --help)
+cat <<EOF
+Usage: $0 [options]
+  --repo URL            Git repo (default ${REPO_URL})
+  --branch NAME         Git branch (default ${BRANCH})
+  --port N              Service port (default ${PORT})
+  --sa-json PATH        Google Service Account JSON
+  --auto-discover       Set AUTO_DISCOVER_SHEETS=1 in .env
+  --with-nginx          Install & configure nginx reverse proxy
+  --domain HOST         Domain for nginx (optional)
+  --email EMAIL         E-mail for Let's Encrypt (optional)
+  --force-reclone       Wipe /opt/filesvc and clone fresh
+EOF
+      exit 0;;
+    *) echo "[WARN] Unknown arg: $1"; shift;;
+  esac
+done
+
+# sa.json рядом с установщиком — автоподхват
+if [[ -z "${SA_JSON}" && -f "${INSTALL_DIR}/sa.json" ]]; then
+  SA_JSON="${INSTALL_DIR}/sa.json"
+  echo "[INFO] Using sa.json from installer dir: ${SA_JSON}"
+fi
+
+echo "[INFO] [1/12] Base packages (no nginx by default)"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y || true
+apt-get install -y ca-certificates curl git unzip jq lsb-release ufw || true
+dpkg --configure -a || true
+
+echo "[INFO] [2/12] Timezone -> Europe/Moscow"
+ln -fs /usr/share/zoneinfo/Europe/Moscow /etc/localtime || true
+dpkg-reconfigure -f noninteractive tzdata || true
+
+echo "[INFO] [3/12] Create user & dirs"
+id -u filesvc &>/dev/null || useradd -r -m -d /opt/filesvc -s /usr/sbin/nologin filesvc || true
+mkdir -p /opt/filesvc /srv/files
+chown -R filesvc:filesvc /opt/filesvc /srv/files
+
+echo "[INFO] [4/12] Node.js (LTS 20) + npm"
+if ! command -v node >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+fi
+if ! command -v npm >/dev/null 2>&1; then
+  apt-get install -y npm || true
+fi
+echo "[INFO] node=$(node -v) npm=$(npm -v)"
+
+echo "[INFO] [5/12] Fetch project from Git: ${REPO_URL} (${BRANCH})"
+# Решение проблемной ситуации: каталог существует, но это не git или нет package.json
+needs_reclone="0"
+if [[ -d /opt/filesvc/.git ]]; then
+  git config --global --add safe.directory /opt/filesvc || true
+  if git -C /opt/filesvc rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C /opt/filesvc fetch --all || true
+    git -C /opt/filesvc checkout -f "${BRANCH}" || true
+    git -C /opt/filesvc reset --hard "origin/${BRANCH}" || true
+  else
+    needs_reclone="1"
+  fi
+else
+  # нет .git — если нет package.json, считаем каталог битым для нашего проекта
+  [[ -f /opt/filesvc/package.json ]] || needs_reclone="1"
+fi
+# Форсируем по флагу
+[[ "${FORCE_RECLONE}" == "1" ]] && needs_reclone="1"
+
+if [[ "${needs_reclone}" == "1" ]]; then
+  echo "[WARN] /opt/filesvc is not a proper repo or missing package.json — recloning..."
+  ts="$(date +%s)"
+  if [[ -d /opt/filesvc && "$(ls -A /opt/filesvc || true)" != "" ]]; then
+    mv /opt/filesvc "/opt/filesvc.bak-${ts}" || true
+  fi
+  mkdir -p /opt/filesvc
+  git clone --branch "${BRANCH}" "${REPO_URL}" /opt/filesvc
+  git config --global --add safe.directory /opt/filesvc || true
+fi
+chown -R filesvc:filesvc /opt/filesvc
+
+echo "[INFO] [6/12] npm install as 'filesvc' (ci/install + extra deps)"
+cd /opt/filesvc
+# создадим локальный кеш npm, чтобы не было правовых проблем
+sudo -u filesvc -H mkdir -p /opt/filesvc/.npm || true
+if sudo -u filesvc -H bash -lc 'cd /opt/filesvc && [ -f package-lock.json ]'; then
+  sudo -u filesvc -H bash -lc 'cd /opt/filesvc && npm ci --omit=dev'
+else
+  sudo -u filesvc -H bash -lc 'cd /opt/filesvc && npm install --omit=dev'
+fi
+# обязательные зависимости
+sudo -u filesvc -H bash -lc 'cd /opt/filesvc && npm install xmlbuilder2 p-limit googleapis showdown compression morgan dotenv --omit=dev'
+
+echo "[INFO] [7/12] .env"
+ENV_FILE="/opt/filesvc/.env"
+touch "${ENV_FILE}"
+grep -q '^PORT=' "${ENV_FILE}" || echo "PORT=${PORT}" >> "${ENV_FILE}"
+grep -q '^FILES_DIR=' "${ENV_FILE}" || echo "FILES_DIR=/srv/files" >> "${ENV_FILE}"
+grep -q '^SHEET_SETTINGS='   "${ENV_FILE}" || echo "SHEET_SETTINGS=Настройки"   >> "${ENV_FILE}"
+grep -q '^SHEET_CATEGORIES=' "${ENV_FILE}" || echo "SHEET_CATEGORIES=Категории" >> "${ENV_FILE}"
+grep -q '^SHEET_PRODUCTS='   "${ENV_FILE}" || echo "SHEET_PRODUCTS=Товары"      >> "${ENV_FILE}"
+if [[ -n "${SA_JSON}" && -f "${SA_JSON}" ]]; then
+  sed -i '/^GOOGLE_APPLICATION_CREDENTIALS=/d' "${ENV_FILE}" || true
+  echo "GOOGLE_APPLICATION_CREDENTIALS=${SA_JSON}" >> "${ENV_FILE}"
+else
+  echo "[WARN] Service Account JSON not provided or not found."
+fi
+if [[ "${AUTO_DISCOVER}" == "1" ]]; then
+  sed -i '/^AUTO_DISCOVER_SHEETS=/d' "${ENV_FILE}" || true
+  echo "AUTO_DISCOVER_SHEETS=1" >> "${ENV_FILE}"
+fi
+chown filesvc:filesvc "${ENV_FILE}"
+chmod 600 "${ENV_FILE}"
+
+echo "[INFO] [8/12] systemd units"
+mkdir -p /etc/systemd/system
+# Если рядом с инсталлером лежат подготовленные юниты — используем их
+SRC_SVC="${INSTALL_DIR}/filesvc.service"
+SRC_FEED_SVC="${INSTALL_DIR}/filesvc-feed.service"
+SRC_FEED_TMR="${INSTALL_DIR}/filesvc-feed.timer"
+
+if [[ -f "${SRC_SVC}" ]]; then
+  cp -f "${SRC_SVC}" /etc/systemd/system/filesvc.service
+else
+  cat > /etc/systemd/system/filesvc.service <<'EOF'
+[Unit]
+Description=Node File Server + YML generator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/opt/filesvc/.env
+WorkingDirectory=/opt/filesvc
+ExecStart=/usr/bin/node /opt/filesvc/server.js
+Restart=always
+User=filesvc
+Group=filesvc
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
+
+if [[ -f "${SRC_FEED_SVC}" ]]; then
+  cp -f "${SRC_FEED_SVC}" /etc/systemd/system/filesvc-feed.service
+else
+  cat > /etc/systemd/system/filesvc-feed.service <<'EOF'
+[Unit]
+Description=Run Feed build via API
+Wants=network-online.target
+After=network-online.target filesvc.service
+
+[Service]
+Type=oneshot
+# Локальный вызов API сборки
+ExecStart=/usr/bin/curl -fsS -X POST http://127.0.0.1:3001/api/feed/yml/build
+TimeoutStartSec=900
+EOF
+fi
+
+if [[ -f "${SRC_FEED_TMR}" ]]; then
+  cp -f "${SRC_FEED_TMR}" /etc/systemd/system/filesvc-feed.timer
+else
+  cat > /etc/systemd/system/filesvc-feed.timer <<'EOF'
+[Unit]
+Description=Schedule weekly feed build (Mon 07:00 MSK)
+
+[Timer]
+# Понедельник 07:00 по системному времени сервера (рекомендуется МСК)
+OnCalendar=Mon *-*-* 07:00:00
+Persistent=true
+AccuracySec=1min
+Unit=filesvc-feed.service
+
+[Install]
+WantedBy=timers.target
+EOF
+fi
+
+systemctl daemon-reload
+systemctl enable filesvc
+systemctl restart filesvc || (journalctl -u filesvc -n 200 --no-pager; exit 1)
+
+systemctl enable filesvc-feed.timer
+systemctl restart filesvc-feed.timer || true
+
+echo "[INFO] [9/12] nginx (optional)"
+if [[ "${WITH_NGINX}" == "1" ]]; then
+  apt-get install -y nginx || true
+  cat > /etc/nginx/sites-available/filesvc.conf <<NGX
+server {
+  listen 80;
+  ${DOMAIN:+server_name ${DOMAIN};}
+  location / {
+    proxy_set_header Host \$host;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_pass http://127.0.0.1:${PORT};
+  }
+}
+NGX
+  ln -sf /etc/nginx/sites-available/filesvc.conf /etc/nginx/sites-enabled/filesvc.conf
+  nginx -t || true
+  systemctl enable nginx || true
+  systemctl restart nginx || true
+fi
+
+echo "[INFO] [10/12] UFW rules (open SSH + ${PORT} ${WITH_NGINX:++ nginx})"
+# текущий SSH порт
+SSH_PORT="$(ss -ltnp 2>/dev/null | awk '/sshd/ && /LISTEN/ {print $4}' | sed -n 's/.*:\([0-9]\+\)$/\1/p' | head -n1)"
+[[ -z "${SSH_PORT}" ]] && SSH_PORT="22"
+if ! ufw status >/dev/null 2>&1; then
+  apt-get install -y ufw || true
+fi
+ufw status | grep -q "Status: active" || {
+  ufw default deny incoming || true
+  ufw default allow outgoing || true
+  ufw allow "${SSH_PORT}/tcp" || true
+  ufw allow "${PORT}/tcp" || true
+  [[ "${WITH_NGINX}" == "1" ]] && ufw allow 'Nginx Full' || true
+  yes | ufw enable || true
+}
+ufw status | grep -qE "( ${PORT}/tcp)" || ufw allow "${PORT}/tcp" || true
+ufw status | grep -qE "( ${SSH_PORT}/tcp)" || ufw allow "${SSH_PORT}/tcp" || true
+[[ "${WITH_NGINX}" == "1" ]] && { ufw status | grep -q "Nginx Full" || ufw allow 'Nginx Full' || true; }
+
+echo "[INFO] [11/12] Next run (if timer active)"
+systemctl list-timers --all --time-format=iso | awk 'NR==1 || /filesvc-feed.timer/' || true
+
+echo "[INFO] [12/12] Checks"
+echo "  systemctl status filesvc --no-pager"
+echo "  systemctl status filesvc-feed.timer --no-pager"
+echo "  curl http://127.0.0.1:${PORT}/healthz"
+echo "  ls -la /srv/files"
+echo "[OK] Done."
