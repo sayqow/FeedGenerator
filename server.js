@@ -8,6 +8,7 @@ const fsp = require('fs/promises');
 const https = require('https');
 const compression = require('compression');
 const morgan = require('morgan');
+const { execFile, exec } = require('child_process');
 
 const {
   generateMany,
@@ -36,6 +37,84 @@ async function countOffersInXml(filePath){
     const m = txt.match(/<offer\b/gi);
     return m ? m.length : 0;
   }catch{ return 0; }
+}
+
+function hasSystemdTimer(cb){
+  execFile('systemctl', ['status','filesvc-feed.timer'], (err) => {
+    cb(!err); // err=null => есть таймер
+  });
+}
+
+function enableTimer(onCalendar, cb){
+  // генерим содержимое юнитов
+  const svc = `[Unit]
+Description=Build YML feeds (one-shot)
+After=network-online.target filesvc.service
+Wants=network-online.target filesvc.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/filesvc/.env
+ExecStartPre=/bin/bash -lc 'for i in {1..30}; do curl -fsS "http://127.0.0.1:${PORT}${BASE_PATH}/healthz" && exit 0; sleep 1; done; exit 1'
+ExecStart=/bin/bash -lc 'curl -fsS -X POST "http://127.0.0.1:${PORT}${BASE_PATH}/api/feed/yml/build"'
+StandardOutput=journal
+StandardError=journal
+`;
+
+  const tim = `[Unit]
+Description=Schedule YML feed build
+
+[Timer]
+OnCalendar=${onCalendar}
+Persistent=true
+RandomizedDelaySec=2min
+Unit=filesvc-feed.service
+
+[Install]
+WantedBy=timers.target
+`;
+
+  // Пытаемся через sudo написать файлы и включить таймер
+  // Если sudo недоступен — вернём инструкцию.
+  const bash = `
+set -e
+umask 022
+TMP_SVC=$(mktemp) ; TMP_TIM=$(mktemp)
+cat >"$TMP_SVC" <<'EOF_SVC'
+${svc}
+EOF_SVC
+cat >"$TMP_TIM" <<'EOF_TIM'
+${tim}
+EOF_TIM
+sudo tee /etc/systemd/system/filesvc-feed.service > /dev/null < "$TMP_SVC"
+sudo tee /etc/systemd/system/filesvc-feed.timer   > /dev/null < "$TMP_TIM"
+sudo systemctl daemon-reload
+sudo systemctl enable --now filesvc-feed.timer
+`;
+
+  exec(bash, {shell:'/bin/bash'}, (err, stdout, stderr) => {
+    if (err) {
+      const manual = [
+        'cat >/etc/systemd/system/filesvc-feed.service <<\'EOF\'',
+        svc.trim(),
+        'EOF',
+        '',
+        'cat >/etc/systemd/system/filesvc-feed.timer <<\'EOF\'',
+        tim.trim(),
+        'EOF',
+        '',
+        'systemctl daemon-reload',
+        'systemctl enable --now filesvc-feed.timer'
+      ].join('\n');
+      cb({
+        ok:false,
+        error: 'Не удалось создать таймер через sudo. Выполните команды вручную от root.',
+        suggest: manual
+      });
+      return;
+    }
+    cb({ ok:true });
+  });
 }
 
 // ---------- files ----------
@@ -120,65 +199,90 @@ app.get(bp('/api/spreadsheets'), async (_req, res) => {
   }
 });
 
-// ---------- next run (ENV -> FILE -> systemd timer) ----------
-const { execFile } = require('child_process');
+
+function tzTokenToOffset(tz) {
+  const map = { MSK: '+03:00', UTC: 'Z', GMT: 'Z' };
+  return map[tz] || null;
+}
+function parseNextColToISO(nextColRaw) {
+  if (!nextColRaw) return null;
+  let s = nextColRaw.trim();
+  s = s.replace(/^[A-Za-z]{3}\s+/, ''); // срезать "Mon "
+  const parts = s.split(/\s+/);
+  if (parts.length < 2) return null;
+  const [datePart, timePart, tzToken = ''] = parts;
+  let isoStr = `${datePart}T${timePart}`;
+  const off = tzTokenToOffset(tzToken);
+  if (off) isoStr += off;
+  const dt = new Date(isoStr);
+  if (!isNaN(dt)) return dt.toISOString();
+  const dt2 = new Date(`${datePart}T${timePart}`);
+  return isNaN(dt2) ? null : dt2.toISOString();
+}
 
 app.get(bp('/api/next-run'), async (_req, res) => {
   try {
-    
-    
-   
-    
+    const envIso = (process.env.NEXT_RUN_ISO || '').trim();
+    if (envIso) return res.json({ ok: true, nextTs: envIso });
 
-    // 2) файл со временем следующего запуска
     try {
       const raw = await fsp.readFile(NEXT_RUN_FILE, 'utf8');
-      const iso = raw.trim();
-      if (iso) return res.json({ ok: true, nextTs: iso });
-    } catch { /* no file or unreadable */ }
+      const fileIso = raw.trim();
+      if (fileIso) return res.json({ ok: true, nextTs: fileIso });
+    } catch {}
 
-    // 3) fallback: берём время из systemd‑таймера
-    execFile('systemctl',
-      ['list-timers', '--all', '--no-legend', '--time-format=iso'],
-      (err, stdout) => {
-        if (err || !stdout) return res.json({ ok: true, nextTs: null });
-
-        // формат колонок: NEXT | LEFT | LAST | PASSED | UNIT | ACTIVATES
-        const line = stdout.split('\n').find(l => /filesvc-feed\.timer/.test(l));
-        if (!line) return res.json({ ok: true, nextTs: null });
-
-        const cols = line.trim().split(/\s{2,}/); // бьём по двойным пробелам
-        const nextCol = cols[0] || '';            // например: 2025-09-01 07:00:00 MSK
-        if (!nextCol) return res.json({ ok: true, nextTs: null });
-
-        // делаем из "YYYY-MM-DD HH:mm:ss MSK" валидную ISO-строку
-        let iso = null;
-        try {
-          // если systemd печатает "MSK", добавим смещение
-          const withTz = nextCol
-            .replace(' ', 'T')           // 2025-09-01T07:00:00 MSK
-            .replace(/\sMSK$/, '+03:00'); // -> 2025-09-01T07:00:00+03:00
-          iso = new Date(withTz).toISOString();
-        } catch { /* ignore */ }
-
-        return res.json({ ok: true, nextTs: iso || null });
-      }
-    );
-  } catch (e) {
+    execFile('systemctl', ['list-timers', '--all', '--no-legend'], (err, stdout) => {
+      if (err || !stdout) return res.json({ ok: true, nextTs: null });
+      const line = stdout.split('\n').find(l => /filesvc-feed\.timer/.test(l));
+      if (!line) return res.json({ ok: true, nextTs: null });
+      const cols = line.trim().split(/\s{2,}/);
+      const nextCol = cols[0] || '';
+      const iso = parseNextColToISO(nextCol);
+      return res.json({ ok: true, nextTs: iso || null });
+    });
+  } catch {
     return res.json({ ok: true, nextTs: null });
   }
 });
 
+
+
+// ---------- create timer (only if not exists) ----------
+app.post(bp('/api/timer/setup'), express.json(), (req, res) => {
+  const onCalendar = String((req.body && req.body.onCalendar) || '').trim();
+  if (!onCalendar) return res.status(400).json({ ok:false, error:'Поле onCalendar обязательно (пример: "Mon 07:00" или "daily" или "*-*-* 07:00:00")' });
+
+  // лёгкая валидация (разрешим популярные формы)
+  const okForm = /^(daily|weekly|monthly|yearly|hourly|Mon|Tue|Wed|Thu|Fri|Sat|Sun|\*\-\*\-\*|\d{4}\-\d{2}\-\d{2}|\@daily|\@weekly|\@monthly|\@hourly)/i.test(onCalendar);
+  if (!okForm) {
+    return res.status(400).json({ ok:false, error:'Похоже, это не похоже на допустимый OnCalendar. Примеры: "Mon 07:00", "daily", "*-*-* 07:00:00".' });
+  }
+
+  hasSystemdTimer((exists) => {
+    if (exists) return res.status(409).json({ ok:false, error:'Таймер уже настроен.' });
+    enableTimer(onCalendar, (r) => {
+      if (!r.ok) return res.status(500).json(r);
+      return res.json({ ok:true });
+    });
+  });
+});
+
 // ---------- MIT license (from GitHub raw, cached) ----------
-let _licCache = { at:0, text:'' };
-app.get(bp('/api/license')), async (_req, res) => { res.redirect(bp('/api/license')); }; // keep old links
+// (если нужна обратная совместимость — делаем отдельный URL-редирект)
+let _licCache = { at: 0, text: '' };
+
+// РАНЬШЕ была битая строка. ВЕРНЫЙ вариант:
+app.get(bp('/api/license-legacy'), (_req, res) => res.redirect(bp('/api/license'))); // optional redirect
+
 app.get(bp('/api/license'), async (_req, res) => {
   const now = Date.now();
-  if (_licCache.text && now - _licCache.at < 6*60*60*1000) return res.type('text/plain').send(_licCache.text);
+  if (_licCache.text && now - _licCache.at < 6 * 60 * 60 * 1000) {
+    return res.type('text/plain').send(_licCache.text);
+  }
 
   const url = 'https://raw.githubusercontent.com/sayqow/FeedGenerator/main/LICENSE';
   https.get(url, r => {
-    if (r.statusCode !== 200){ res.status(502).send('Cannot fetch license'); return; }
+    if (r.statusCode !== 200) { res.status(502).send('Cannot fetch license'); return; }
     let data = '';
     r.setEncoding('utf8');
     r.on('data', chunk => data += chunk);
@@ -188,6 +292,7 @@ app.get(bp('/api/license'), async (_req, res) => {
     });
   }).on('error', () => res.status(502).send('Cannot fetch license'));
 });
+
 
 // ---------- health ----------
 app.get(bp('/healthz'), (_req, res) => res.json({ ok:true, ts:new Date().toISOString() }));
@@ -233,6 +338,9 @@ body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,Se
 .btn-ghost{background:var(--chip);border:1px solid #1e2936;color:var(--text)}
 .btn-ghost:hover{background:#0e1620}
 
+input[type="text"]{background:#0e1620;border:1px solid #223041;color:#e8f0f7;border-radius:10px;padding:10px 12px;outline:none;width:100%}
+label{display:block;margin:10px 0 6px;color:#9fb0bf;font-size:14px}
+
 .list{padding-left:18px;margin:8px 0 0}
 .list a{color:var(--accent);text-decoration:none}
 .footer{color:var(--muted);font-size:13px;margin-top:8px}
@@ -260,7 +368,6 @@ app.get(bp('/assets/favicon.svg'), (_req,res) => {
 });
 
 // ---------- page ----------
-app.get(bp('/')), async (_req,res)=>{ res.redirect(bp('/')); };
 app.get(bp('/'), async (_req, res) => {
   const html = `
 <!doctype html><html lang="ru"><head>
@@ -317,7 +424,20 @@ app.get(bp('/'), async (_req, res) => {
 <div class="modal" id="mdNext">
   <div class="box">
     <div class="head"><b>Информация</b><button class="btn btn-ghost" onclick="closeModal('mdNext')">Закрыть</button></div>
-    <div class="body"><div id="nextText" class="faded">Загружаю…</div></div>
+    <div class="body">
+      <div id="nextText" class="faded">Загружаю…</div>
+
+      <div id="setupWrap" style="display:none; margin-top:14px">
+        <hr style="border:0;border-top:1px solid #172230;margin:10px 0 16px 0"/>
+        <div class="faded" style="margin-bottom:6px">Таймер не настроен — включить автосбор?</div>
+        <label for="oc">OnCalendar (пример: <span class="mono">Mon 07:00</span> / <span class="mono">daily</span> / <span class="mono">*-*-* 07:00:00</span>)</label>
+        <input id="oc" type="text" value="Mon 07:00"/>
+        <div style="display:flex; gap:10px; margin-top:10px">
+          <button class="btn btn-ok" id="btnTimer">Включить автосбор</button>
+          <span id="timerMsg" class="faded"></span>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -330,7 +450,7 @@ app.get(bp('/'), async (_req, res) => {
         <li><code>GET ${bp('/api/feed/yml/list')}</code> — список файлов</li>
         <li><code>GET ${bp('/api/spreadsheets')}</code> — доступные Google таблицы</li>
         <li><code>GET ${bp('/api/next-run')}</code> — время следующего запуска (если задано)</li>
-        <li><code>GET ${bp('/healthz')}</code> — health‑check</li>
+        <li><code>GET ${bp('/healthz')}</code> — health-check</li>
       </ul>
     </div>
   </div>
@@ -439,6 +559,8 @@ document.getElementById('miDocs').onclick = ()=>{ panel.classList.remove('open')
 document.getElementById('miNext').onclick = async ()=>{
   panel.classList.remove('open'); openModal('mdNext');
   const box = document.getElementById('nextText');
+  const setupWrap = document.getElementById('setupWrap');
+  setupWrap.style.display = 'none';
   try{
     const r = await fetch(BP + '/api/next-run'); const d = await r.json();
     if(d.nextTs){
@@ -447,6 +569,7 @@ document.getElementById('miNext').onclick = async ()=>{
       box.textContent = 'Следующий автосбор: ' + intl.format(dt) + ' (МСК)';
     }else{
       box.textContent = 'Автосбор не настроен.';
+      setupWrap.style.display = 'block';
     }
   }catch(e){ box.textContent = 'Ошибка: '+e.message; }
 };
@@ -474,6 +597,42 @@ document.getElementById('miMIT').onclick = async ()=>{
   }catch(e){ pre.textContent = 'Не удалось получить лицензию: ' + e.message; }
 };
 document.getElementById('linkMIT').onclick = (e)=>{ e.preventDefault(); document.getElementById('miMIT').click(); };
+
+// включение таймера из модалки
+document.getElementById('btnTimer').onclick = async ()=>{
+  const oc = document.getElementById('oc').value.trim();
+  const msg = document.getElementById('timerMsg');
+  msg.textContent = 'Сохраняю…';
+  try{
+    const r = await fetch(BP + '/api/timer/setup', {
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body: JSON.stringify({ onCalendar: oc })
+    });
+    const d = await r.json();
+    if(!r.ok || d.ok===false){
+      if(d.suggest){
+        msg.innerHTML = 'Нет прав на автоматическую установку. Выполните от root:<br><pre class="mono" style="white-space:pre-wrap">'+esc(d.suggest)+'</pre>';
+      }else{
+        msg.textContent = 'Ошибка: ' + (d.error || 'неизвестно');
+      }
+      return;
+    }
+    msg.textContent = 'Готово. Обновляю информацию…';
+    // обновим блок с датой
+    const r2 = await fetch(BP + '/api/next-run'); const d2 = await r2.json();
+    if(d2.nextTs){
+      const dt = new Date(d2.nextTs);
+      const intl = new Intl.DateTimeFormat('ru-RU',{timeZone:'Europe/Moscow', dateStyle:'full', timeStyle:'short'});
+      document.getElementById('nextText').textContent = 'Следующий автосбор: ' + intl.format(dt) + ' (МСК)';
+      document.getElementById('setupWrap').style.display='none';
+    }else{
+      document.getElementById('nextText').textContent = 'Таймер включён, но время неизвестно.';
+    }
+  }catch(e){
+    msg.textContent = 'Ошибка: ' + e.message;
+  }
+};
 
 refreshFiles();
 </script>
