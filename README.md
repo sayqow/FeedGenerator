@@ -1,3 +1,6 @@
+## Contributors
+Thanks to all the people who contribute 💜  
+[![Contributors](https://contrib.rocks/image?repo=org/repo-name)](https://github.com/org/repo-name/graphs/contributors)
 
 # FeedGenerator
 
